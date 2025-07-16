@@ -17,6 +17,8 @@ import os
 import re
 import uuid
 import warnings
+import requests
+
 from collections.abc import Generator
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -807,41 +809,30 @@ class TransformersModel(Model):
         **kwargs,
     ):
         try:
-            import torch
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoModelForImageTextToText,
-                AutoProcessor,
-                AutoTokenizer,
-                TextIteratorStreamer,
-            )
-        except ModuleNotFoundError:
+            from transformers import AutoModelForCausalLM, StoppingCriteriaList, AutoModelForImageTextToText, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer, TextIteratorStreamer
+        except ImportError:
             raise ModuleNotFoundError(
                 "Please install 'transformers' extra to use 'TransformersModel': `pip install 'smolagents[transformers]'`"
             )
 
         if not model_id:
-            warnings.warn(
-                "The 'model_id' parameter will be required in version 2.0.0. "
-                "Please update your code to pass this parameter to avoid future errors. "
-                "For now, it defaults to 'HuggingFaceTB/SmolLM2-1.7B-Instruct'.",
-                FutureWarning,
-            )
             model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
         default_max_tokens = 4096
         max_new_tokens = kwargs.get("max_new_tokens") or kwargs.get("max_tokens")
         if not max_new_tokens:
             kwargs["max_new_tokens"] = default_max_tokens
-            logger.warning(
-                f"`max_new_tokens` not provided, using this default value for `max_new_tokens`: {default_max_tokens}"
-            )
 
         if device_map is None:
             device_map = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device_map}")
+
         self._is_vlm = False
+        self.processor = None
+        self.tokenizer = None
+        self.streamer = None
+
         try:
+            # Попытка загрузить как VLM модель
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_id,
                 device_map=device_map,
@@ -849,11 +840,35 @@ class TransformersModel(Model):
                 trust_remote_code=trust_remote_code,
             )
             self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-            self._is_vlm = True
-            self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)  # type: ignore
 
-        except ValueError as e:
-            if "Unrecognized configuration class" in str(e):
+            # Добавляем специальные токены
+            special_tokens = ["<|image|>", "<|video|>", "<|pixelpointing|>"]
+            self.processor.tokenizer.add_special_tokens({
+                "additional_special_tokens": special_tokens
+            })
+            self.model.resize_token_embeddings(len(self.processor.tokenizer))
+
+            self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            self._is_vlm = True
+        except Exception as e:
+            try:
+                # Если не получилось — пытаемся как Vision2Seq
+                self.model = AutoModelForVision2Seq.from_pretrained(
+                    model_id,
+                    device_map=device_map,
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=trust_remote_code,
+                )
+                self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+                special_tokens = ["<|image|>", "<|video|>", "<|pixelpointing|>"]
+                self.processor.tokenizer.add_special_tokens({
+                    "additional_special_tokens": special_tokens
+                })
+                self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                self._is_vlm = True
+            except Exception as e2:
+                # Иначе — просто языковая модель
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_id,
                     device_map=device_map,
@@ -861,14 +876,11 @@ class TransformersModel(Model):
                     trust_remote_code=trust_remote_code,
                 )
                 self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-                self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)  # type: ignore
-            else:
-                raise e
-        except Exception as e:
-            raise ValueError(f"Failed to load tokenizer and model for {model_id=}: {e}") from e
+                self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
         super().__init__(flatten_messages_as_text=not self._is_vlm, model_id=model_id, **kwargs)
 
-    def make_stopping_criteria(self, stop_sequences: list[str], tokenizer) -> "StoppingCriteriaList":
+    def make_stopping_criteria(self, stop_sequences: list[str], tokenizer) -> StoppingCriteriaList:
         from transformers import StoppingCriteria, StoppingCriteriaList
 
         class StopOnStrings(StoppingCriteria):
@@ -891,51 +903,72 @@ class TransformersModel(Model):
 
     def _prepare_completion_args(
         self,
-        messages: list[ChatMessage],
-        stop_sequences: list[str] | None = None,
-        tools_to_call_from: list[Tool] | None = None,
+        messages: List[Dict],
+        stop_sequences: Optional[List[str]] = None,
         **kwargs,
-    ) -> dict[str, Any]:
-        completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            **kwargs,
-        )
-
-        messages = completion_kwargs.pop("messages")
-        stop_sequences = completion_kwargs.pop("stop", None)
-        tools = completion_kwargs.pop("tools", None)
-
-        max_new_tokens = (
-            kwargs.get("max_new_tokens")
-            or kwargs.get("max_tokens")
-            or self.kwargs.get("max_new_tokens")
-            or self.kwargs.get("max_tokens")
-            or 1024
-        )
-        prompt_tensor = (self.processor if hasattr(self, "processor") else self.tokenizer).apply_chat_template(
-            messages,
-            tools=tools,
-            return_tensors="pt",
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-        )
-        prompt_tensor = prompt_tensor.to(self.model.device)  # type: ignore
-        if hasattr(prompt_tensor, "input_ids"):
-            prompt_tensor = prompt_tensor["input_ids"]
-
+    ) -> dict:
+        completion_kwargs = {}
         model_tokenizer = self.processor.tokenizer if hasattr(self, "processor") else self.tokenizer
-        stopping_criteria = (
-            self.make_stopping_criteria(stop_sequences, tokenizer=model_tokenizer) if stop_sequences else None
-        )
-        completion_kwargs["max_new_tokens"] = max_new_tokens
-        return dict(
-            inputs=prompt_tensor,
-            use_cache=True,
-            stopping_criteria=stopping_criteria,
-            **completion_kwargs,
-        )
+        max_new_tokens = kwargs.get("max_new_tokens") or self.kwargs.get("max_new_tokens", 2048)
+
+        if self._is_vlm:
+            texts = []
+            images = []
+
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, dict) and "image" in content:
+                    image_url = content["image"]
+                    response = requests.get(image_url)
+                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                    images.append(image)
+                    texts.append(f"<|image|>\n{content['text']}")
+                else:
+                    texts.append(content)
+
+            text_prompt = "\n".join(texts)
+
+            inputs_tensor = self.processor(
+                text=text_prompt,
+                images=images[0] if images else None,
+                return_tensors="pt"
+            ).to(self.model.device)
+
+            stopping_criteria = (
+                self.make_stopping_criteria(stop_sequences, tokenizer=model_tokenizer)
+                if stop_sequences else None
+            )
+
+            return dict(
+                inputs=inputs_tensor["input_ids"],
+                pixel_values=inputs_tensor.get("pixel_values"),
+                use_cache=True,
+                stopping_criteria=stopping_criteria,
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
+        else:
+            prompt_tensor = self.tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+            ).to(self.model.device)
+
+            if hasattr(prompt_tensor, "input_ids"):
+                prompt_tensor = prompt_tensor["input_ids"]
+
+            stopping_criteria = (
+                self.make_stopping_criteria(stop_sequences, tokenizer=model_tokenizer)
+                if stop_sequences else None
+            )
+
+            return dict(
+                inputs=prompt_tensor,
+                use_cache=True,
+                stopping_criteria=stopping_criteria,
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
 
     def generate(
         self,
@@ -947,27 +980,39 @@ class TransformersModel(Model):
     ) -> ChatMessage:
         if response_format is not None:
             raise ValueError("Transformers does not support structured outputs, use VLLMModel for this.")
+
         generation_kwargs = self._prepare_completion_args(
             messages=messages,
             stop_sequences=stop_sequences,
             tools_to_call_from=tools_to_call_from,
             **kwargs,
         )
-        count_prompt_tokens = generation_kwargs["inputs"].shape[1]  # type: ignore
-        out = self.model.generate(
-            **generation_kwargs,
-        )
+
+        inputs = generation_kwargs.pop("inputs")
+        pixel_values = generation_kwargs.pop("pixel_values", None)
+
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids=inputs,
+                pixel_values=pixel_values,
+                **generation_kwargs,
+            )
+
+        count_prompt_tokens = inputs.shape[1]
         generated_tokens = out[0, count_prompt_tokens:]
+
         if hasattr(self, "processor"):
             output_text = self.processor.decode(generated_tokens, skip_special_tokens=True)
         else:
             output_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         if stop_sequences is not None:
+            from smolagents.utils import remove_stop_sequences
             output_text = remove_stop_sequences(output_text, stop_sequences)
 
         self._last_input_token_count = count_prompt_tokens
         self._last_output_token_count = len(generated_tokens)
+
         return ChatMessage(
             role=MessageRole.ASSISTANT,
             content=output_text,
@@ -988,9 +1033,10 @@ class TransformersModel(Model):
         response_format: dict[str, str] | None = None,
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
-    ) -> Generator[ChatMessageStreamDelta]:
+    ) -> Generator[ChatMessageStreamDelta, None, None]:
         if response_format is not None:
             raise ValueError("Transformers does not support structured outputs, use VLLMModel for this.")
+
         generation_kwargs = self._prepare_completion_args(
             messages=messages,
             stop_sequences=stop_sequences,
@@ -999,20 +1045,17 @@ class TransformersModel(Model):
             **kwargs,
         )
 
-        # Get prompt token count once
-        count_prompt_tokens = generation_kwargs["inputs"].shape[1]  # type: ignore
+        count_prompt_tokens = generation_kwargs["inputs"].shape[1]
         self._last_input_token_count = count_prompt_tokens
 
-        # Start generation in a separate thread
         thread = Thread(target=self.model.generate, kwargs={"streamer": self.streamer, **generation_kwargs})
         thread.start()
 
-        # Process streaming output
         is_first_token = True
         count_generated_tokens = 0
+
         for new_text in self.streamer:
             count_generated_tokens += 1
-            # Only include input tokens in the first yielded token
             input_tokens = count_prompt_tokens if is_first_token else 0
             is_first_token = False
             yield ChatMessageStreamDelta(
@@ -1021,9 +1064,8 @@ class TransformersModel(Model):
                 token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=1),
             )
             count_prompt_tokens = 0
-        thread.join()
 
-        # Update final output token count
+        thread.join()
         self._last_output_token_count = count_generated_tokens
 
 
