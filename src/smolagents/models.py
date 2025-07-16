@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from threading import Thread
 from typing import TYPE_CHECKING, Any
-
+from transformers import AutoModelForCausalLM, StoppingCriteriaList, AutoModelForImageTextToText, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer, TextIteratorStreamer
 from .monitoring import TokenUsage
 from .tools import Tool
 from .utils import RateLimiter, _is_package_available, encode_image_base64, make_image_url, parse_json_blob
