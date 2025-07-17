@@ -33,6 +33,7 @@ from transformers import AutoModelForCausalLM, StoppingCriteriaList, AutoModelFo
 from .monitoring import TokenUsage
 from .tools import Tool
 from .utils import RateLimiter, _is_package_available, encode_image_base64, make_image_url, parse_json_blob
+from smolagents.utils import remove_stop_sequences
 
 
 if TYPE_CHECKING:
@@ -1111,7 +1112,6 @@ class TransformersModel(Model):
             output_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         if stop_sequences is not None:
-            from smolagents.utils import remove_stop_sequences
             output_text = remove_stop_sequences(output_text, stop_sequences)
 
         self._last_input_token_count = count_prompt_tokens
