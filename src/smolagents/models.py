@@ -834,53 +834,80 @@ class TransformersModel(Model):
         self.processor = None
         self.tokenizer = None
         self.streamer = None
+        self._is_qwen_vl = False
+        self.process_vision_info = None
 
-        try:
-            # Попытка загрузить как VLM модель
-            self.model = AutoModelForImageTextToText.from_pretrained(
+        # Qwen2.5-VL detection and special loading
+        if (
+            "qwen2.5-vl" in model_id.lower() or
+            "qwen2_5_vl" in model_id.lower() or
+            "qwen/qwen2.5-vl" in model_id.lower()
+        ):
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+                from qwen_vl_utils import process_vision_info
+            except ImportError as e:
+                raise ModuleNotFoundError(
+                    "Please install 'qwen-vl-utils' and the latest 'transformers' for Qwen2.5-VL support: "
+                    "pip install git+https://github.com/huggingface/transformers accelerate qwen-vl-utils"
+                ) from e
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_id,
                 device_map=device_map,
                 torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
             )
             self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-
-            # Добавляем специальные токены
-            special_tokens = ["<|image|>", "<|video|>", "<|pixelpointing|>"]
-            self.processor.tokenizer.add_special_tokens({
-                "additional_special_tokens": special_tokens
-            })
-            self.model.resize_token_embeddings(len(self.processor.tokenizer))
-
-            self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            self.process_vision_info = process_vision_info
+            self._is_qwen_vl = True
             self._is_vlm = True
-        except Exception as e:
+        else:
             try:
-                # Если не получилось — пытаемся как Vision2Seq
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                # Попытка загрузить как VLM модель
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_id,
                     device_map=device_map,
                     torch_dtype=torch_dtype,
                     trust_remote_code=trust_remote_code,
                 )
                 self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+
+                # Добавляем специальные токены
                 special_tokens = ["<|image|>", "<|video|>", "<|pixelpointing|>"]
                 self.processor.tokenizer.add_special_tokens({
                     "additional_special_tokens": special_tokens
                 })
                 self.model.resize_token_embeddings(len(self.processor.tokenizer))
+
                 self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
                 self._is_vlm = True
-            except Exception as e2:
-                # Иначе — просто языковая модель
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    device_map=device_map,
-                    torch_dtype=torch_dtype,
-                    trust_remote_code=trust_remote_code,
-                )
-                self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-                self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            except Exception as e:
+                try:
+                    # Если не получилось — пытаемся как Vision2Seq
+                    self.model = AutoModelForVision2Seq.from_pretrained(
+                        model_id,
+                        device_map=device_map,
+                        torch_dtype=torch_dtype,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+                    special_tokens = ["<|image|>", "<|video|>", "<|pixelpointing|>"]
+                    self.processor.tokenizer.add_special_tokens({
+                        "additional_special_tokens": special_tokens
+                    })
+                    self.model.resize_token_embeddings(len(self.processor.tokenizer))
+                    self.streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    self._is_vlm = True
+                except Exception as e2:
+                    # Иначе — просто языковая модель
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_id,
+                        device_map=device_map,
+                        torch_dtype=torch_dtype,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+                    self.streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
         super().__init__(flatten_messages_as_text=not self._is_vlm, model_id=model_id, **kwargs)
 
@@ -915,6 +942,25 @@ class TransformersModel(Model):
         model_tokenizer = self.processor.tokenizer if hasattr(self, "processor") else self.tokenizer
         max_new_tokens = kwargs.get("max_new_tokens") or self.kwargs.get("max_new_tokens", 2048)
 
+        if getattr(self, "_is_qwen_vl", False):
+            # Qwen2.5-VL special handling
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = self.process_vision_info(messages)
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.model.device)
+            return dict(
+                inputs=inputs,
+                max_new_tokens=max_new_tokens,
+                **kwargs,
+            )
         if self._is_vlm:
             texts = []
             images = []
@@ -991,6 +1037,36 @@ class TransformersModel(Model):
             tools_to_call_from=tools_to_call_from,
             **kwargs,
         )
+
+        if getattr(self, "_is_qwen_vl", False):
+            inputs = generation_kwargs["inputs"]
+            with torch.no_grad():
+                generated_ids = self.model.generate(**inputs, max_new_tokens=generation_kwargs.get("max_new_tokens", 128))
+            # Trim the prompt tokens from the output
+            input_ids = inputs["input_ids"]
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            output_text = output_text[0] if isinstance(output_text, list) else output_text
+            count_prompt_tokens = input_ids.shape[1] if hasattr(input_ids, 'shape') else len(input_ids[0])
+            generated_tokens = generated_ids_trimmed[0] if isinstance(generated_ids_trimmed, list) else generated_ids_trimmed
+            self._last_input_token_count = count_prompt_tokens
+            self._last_output_token_count = len(generated_tokens)
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=output_text,
+                raw={
+                    "out": output_text,
+                    "completion_kwargs": {key: value for key, value in generation_kwargs.items() if key != "inputs"},
+                },
+                token_usage=TokenUsage(
+                    input_tokens=count_prompt_tokens,
+                    output_tokens=len(generated_tokens),
+                ),
+            )
 
         inputs = generation_kwargs.pop("inputs")
         pixel_values = generation_kwargs.pop("pixel_values", None)
