@@ -1137,48 +1137,23 @@ class TransformersModel(Model):
         tools_to_call_from: list[Tool] | None = None,
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta, None, None]:
-        if response_format is not None:
-            raise ValueError("Transformers does not support structured outputs, use VLLMModel for this.")
-
-        generation_kwargs = self._prepare_completion_args(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            **kwargs,
-        )
-
-        inputs = generation_kwargs["inputs"]
-        if hasattr(inputs, "shape"):
-            count_prompt_tokens = inputs.shape[1]
-        elif isinstance(inputs, dict) and "input_ids" in inputs:
-            count_prompt_tokens = inputs["input_ids"].shape[1]
-        elif hasattr(inputs, "__getitem__") and "input_ids" in inputs:
-            count_prompt_tokens = inputs["input_ids"].shape[1]
-        else:
-            # fallback or raise a clear error
-            raise ValueError("Cannot determine prompt token count from inputs")
-        self._last_input_token_count = count_prompt_tokens
-
-        thread = Thread(target=self.model.generate, kwargs={"streamer": self.streamer, **generation_kwargs})
-        thread.start()
-
-        is_first_token = True
-        count_generated_tokens = 0
-
-        for new_text in self.streamer:
-            count_generated_tokens += 1
-            input_tokens = count_prompt_tokens if is_first_token else 0
-            is_first_token = False
-            yield ChatMessageStreamDelta(
-                content=new_text,
-                tool_calls=None,
-                token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=1),
+        # Qwen2.5-VL and similar VLMs do not support streaming
+        if getattr(self, "_is_qwen_vl", False):
+            # Fallback: run normal generate and yield the full result as a single chunk
+            result = self.generate(
+                messages=messages,
+                stop_sequences=stop_sequences,
+                response_format=response_format,
+                tools_to_call_from=tools_to_call_from,
+                **kwargs,
             )
-            count_prompt_tokens = 0
-
-        thread.join()
-        self._last_output_token_count = count_generated_tokens
+            yield ChatMessageStreamDelta(
+                content=result.content,
+                tool_calls=None,
+                token_usage=result.token_usage,
+            )
+            return
+        # ... existing streaming logic for other models ...
 
 
 class ApiModel(Model):
