@@ -938,6 +938,15 @@ class TransformersModel(Model):
         stop_sequences: Optional[List[str]] = None,
         **kwargs,
     ) -> dict:
+        # Ensure messages are always a list of dicts, not ChatMessage objects
+        from .models import get_clean_message_list, tool_role_conversions
+        if messages and hasattr(messages[0], 'role') and hasattr(messages[0], 'content'):
+            messages = get_clean_message_list(
+                messages,
+                role_conversions=tool_role_conversions,
+                convert_images_to_image_urls=False,
+                flatten_messages_as_text=False,
+            )
         completion_kwargs = {}
         model_tokenizer = self.processor.tokenizer if hasattr(self, "processor") else self.tokenizer
         max_new_tokens = kwargs.get("max_new_tokens") or self.kwargs.get("max_new_tokens", 2048)
