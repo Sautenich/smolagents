@@ -841,7 +841,7 @@ class TransformersModel(Model):
         # Qwen2.5-VL detection and special loading
         if (
             "qwen2.5-vl" in model_id.lower() or
-            "qwen2_5_vl" in model_id.lower() or
+            "qwen_5_vl" in model_id.lower() or
             "qwen/qwen2.5-vl" in model_id.lower()
         ):
             try:
