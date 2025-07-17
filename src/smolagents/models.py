@@ -976,13 +976,28 @@ class TransformersModel(Model):
 
             for msg in messages:
                 content = msg.get("content", "")
-                if isinstance(content, dict) and "image" in content:
-                    image_url = content["image"]
-                    response = requests.get(image_url)
-                    image = Image.open(BytesIO(response.content)).convert("RGB")
-                    images.append(image)
-                    texts.append(f"<|image|>\n{content['text']}")
-                else:
+                # If content is a list, flatten and extract text/image
+                if isinstance(content, list):
+                    for el in content:
+                        if isinstance(el, dict):
+                            if el.get("type") == "image" and "image" in el:
+                                image_url = el["image"]
+                                response = requests.get(image_url)
+                                image = Image.open(BytesIO(response.content)).convert("RGB")
+                                images.append(image)
+                                texts.append("<|image|>")
+                            elif el.get("type") == "text" and "text" in el:
+                                texts.append(el["text"])
+                elif isinstance(content, dict):
+                    if content.get("type") == "image" and "image" in content:
+                        image_url = content["image"]
+                        response = requests.get(image_url)
+                        image = Image.open(BytesIO(response.content)).convert("RGB")
+                        images.append(image)
+                        texts.append("<|image|>")
+                    elif content.get("type") == "text" and "text" in content:
+                        texts.append(content["text"])
+                elif isinstance(content, str):
                     texts.append(content)
 
             text_prompt = "\n".join(texts)
