@@ -33,7 +33,6 @@ from transformers import AutoModelForCausalLM, StoppingCriteriaList, AutoModelFo
 from .monitoring import TokenUsage
 from .tools import Tool
 from .utils import RateLimiter, _is_package_available, encode_image_base64, make_image_url, parse_json_blob
-from smolagents.utils import remove_stop_sequences
 
 
 if TYPE_CHECKING:
@@ -1149,7 +1148,16 @@ class TransformersModel(Model):
             **kwargs,
         )
 
-        count_prompt_tokens = generation_kwargs["inputs"].shape[1]
+        inputs = generation_kwargs["inputs"]
+        if hasattr(inputs, "shape"):
+            count_prompt_tokens = inputs.shape[1]
+        elif isinstance(inputs, dict) and "input_ids" in inputs:
+            count_prompt_tokens = inputs["input_ids"].shape[1]
+        elif hasattr(inputs, "__getitem__") and "input_ids" in inputs:
+            count_prompt_tokens = inputs["input_ids"].shape[1]
+        else:
+            # fallback or raise a clear error
+            raise ValueError("Cannot determine prompt token count from inputs")
         self._last_input_token_count = count_prompt_tokens
 
         thread = Thread(target=self.model.generate, kwargs={"streamer": self.streamer, **generation_kwargs})
