@@ -981,9 +981,18 @@ class TransformersModel(Model):
                     for el in content:
                         if isinstance(el, dict):
                             if el.get("type") == "image" and "image" in el:
-                                image_url = el["image"]
-                                response = requests.get(image_url)
-                                image = Image.open(BytesIO(response.content)).convert("RGB")
+                                image_obj = el["image"]
+                                if isinstance(image_obj, Image.Image):
+                                    image = image_obj.convert("RGB")
+                                elif isinstance(image_obj, str):
+                                    # Assume it's a URL or file path
+                                    if image_obj.startswith("http://") or image_obj.startswith("https://"):
+                                        response = requests.get(image_obj)
+                                        image = Image.open(BytesIO(response.content)).convert("RGB")
+                                    else:
+                                        image = Image.open(image_obj).convert("RGB")
+                                else:
+                                    raise ValueError(f"Unsupported image type: {type(image_obj)}")
                                 images.append(image)
                                 texts.append("<|image|>")
                             elif el.get("type") == "text" and "text" in el:
@@ -2045,4 +2054,4 @@ __all__ = [
     "AmazonBedrockServerModel",
     "AmazonBedrockModel",
     "ChatMessage",
-]
+ы]
